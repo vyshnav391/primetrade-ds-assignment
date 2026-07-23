@@ -1,0 +1,183 @@
+"""
+Trader Performance vs. Bitcoin Market Sentiment
+------------------------------------------------
+Explores the relationship between the Fear & Greed Index and trader
+performance on Hyperliquid, and produces the summary tables and charts
+referenced in outputs/.
+
+Usage:
+    python src/analysis.py
+"""
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import numpy as np
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+DATA_DIR = ROOT / "data"
+OUT_DIR = ROOT / "outputs"
+FIG_DIR = OUT_DIR / "figures"
+
+SENTIMENT_ORDER = ["Extreme Fear", "Fear", "Neutral", "Greed", "Extreme Greed"]
+SENTIMENT_COLORS = {
+    "Extreme Fear": "#8B0000",
+    "Fear": "#E4572E",
+    "Neutral": "#8D99AE",
+    "Greed": "#4C956C",
+    "Extreme Greed": "#1B4332",
+}
+
+
+def load_data():
+    trades = pd.read_csv(DATA_DIR / "historical_data.csv")
+    trades["Timestamp IST"] = pd.to_datetime(trades["Timestamp IST"], format="%d-%m-%Y %H:%M")
+    trades["date"] = trades["Timestamp IST"].dt.date
+
+    fg = pd.read_csv(DATA_DIR / "fear_greed_index.csv")
+    fg["date"] = pd.to_datetime(fg["date"]).dt.date
+    fg = fg[["date", "value", "classification"]].rename(
+        columns={"value": "fg_value", "classification": "sentiment"}
+    )
+    return trades, fg
+
+
+def merge_data(trades, fg):
+    merged = trades.merge(fg, on="date", how="inner")
+    merged["is_closed_trade"] = merged["Closed PnL"] != 0
+    merged["is_win"] = merged["Closed PnL"] > 0
+    return merged
+
+
+def sentiment_summary(merged):
+    agg = merged.groupby("sentiment").agg(
+        trades=("Closed PnL", "count"),
+        total_pnl=("Closed PnL", "sum"),
+        avg_pnl=("Closed PnL", "mean"),
+        median_pnl=("Closed PnL", "median"),
+        avg_size_usd=("Size USD", "mean"),
+        total_volume_usd=("Size USD", "sum"),
+        avg_fee=("Fee", "mean"),
+    )
+    closed = merged[merged["is_closed_trade"]]
+    win_rate = closed.groupby("sentiment")["is_win"].mean() * 100
+    agg["win_rate_pct"] = win_rate
+    agg = agg.reindex(SENTIMENT_ORDER).round(2)
+    agg.to_csv(OUT_DIR / "sentiment_summary.csv")
+    return agg
+
+
+def account_level_summary(merged):
+    """Per-account average PnL split by sentiment bucket, to see if the
+    effect holds across traders rather than being driven by a few whales."""
+    pivot = merged.pivot_table(
+        index="Account", columns="sentiment", values="Closed PnL", aggfunc="mean"
+    ).reindex(columns=SENTIMENT_ORDER)
+    pivot.to_csv(OUT_DIR / "account_level_avg_pnl.csv")
+    return pivot
+
+
+def leverage_proxy(merged):
+    """Hyperliquid raw export has no explicit leverage column; we use
+    Size USD / |Start Position value| as a rough proxy for position
+    aggressiveness is unreliable, so instead we report trade size (USD)
+    distribution by sentiment as the aggressiveness proxy."""
+    size_by_sentiment = merged.groupby("sentiment")["Size USD"].describe()
+    size_by_sentiment = size_by_sentiment.reindex(SENTIMENT_ORDER)
+    size_by_sentiment.to_csv(OUT_DIR / "trade_size_distribution.csv")
+    return size_by_sentiment
+
+
+def plot_avg_pnl(agg):
+    fig, ax = plt.subplots(figsize=(8, 5))
+    colors = [SENTIMENT_COLORS[s] for s in agg.index]
+    ax.bar(agg.index, agg["avg_pnl"], color=colors)
+    ax.set_title("Average Closed PnL per Trade by Market Sentiment")
+    ax.set_ylabel("Average Closed PnL (USD)")
+    ax.axhline(0, color="black", linewidth=0.8)
+    plt.xticks(rotation=20)
+    plt.tight_layout()
+    plt.savefig(FIG_DIR / "avg_pnl_by_sentiment.png", dpi=150)
+    plt.close()
+
+
+def plot_win_rate(agg):
+    fig, ax = plt.subplots(figsize=(8, 5))
+    colors = [SENTIMENT_COLORS[s] for s in agg.index]
+    ax.bar(agg.index, agg["win_rate_pct"], color=colors)
+    ax.set_title("Win Rate by Market Sentiment")
+    ax.set_ylabel("Win rate (%)")
+    ax.set_ylim(0, 100)
+    plt.xticks(rotation=20)
+    plt.tight_layout()
+    plt.savefig(FIG_DIR / "win_rate_by_sentiment.png", dpi=150)
+    plt.close()
+
+
+def plot_volume(agg):
+    fig, ax = plt.subplots(figsize=(8, 5))
+    colors = [SENTIMENT_COLORS[s] for s in agg.index]
+    ax.bar(agg.index, agg["total_volume_usd"] / 1e6, color=colors)
+    ax.set_title("Total Traded Volume by Market Sentiment")
+    ax.set_ylabel("Volume (USD, millions)")
+    plt.xticks(rotation=20)
+    plt.tight_layout()
+    plt.savefig(FIG_DIR / "volume_by_sentiment.png", dpi=150)
+    plt.close()
+
+
+def plot_daily_pnl_vs_fg(merged):
+    daily = merged.groupby("date").agg(
+        pnl=("Closed PnL", "sum"), fg_value=("fg_value", "mean")
+    ).reset_index()
+    daily = daily.sort_values("date")
+
+    fig, ax1 = plt.subplots(figsize=(11, 5))
+    ax1.plot(daily["date"], daily["pnl"].rolling(7, min_periods=1).mean(), color="#2b6cb0", label="7d avg daily PnL")
+    ax1.set_ylabel("7-day avg daily closed PnL (USD)", color="#2b6cb0")
+    ax1.tick_params(axis="y", labelcolor="#2b6cb0")
+
+    ax2 = ax1.twinx()
+    ax2.plot(daily["date"], daily["fg_value"], color="#c05621", alpha=0.5, label="Fear & Greed Index")
+    ax2.set_ylabel("Fear & Greed Index", color="#c05621")
+    ax2.tick_params(axis="y", labelcolor="#c05621")
+
+    fig.suptitle("Daily Trader PnL (7d avg) vs. Fear & Greed Index")
+    fig.tight_layout()
+    plt.savefig(FIG_DIR / "daily_pnl_vs_fg_index.png", dpi=150)
+    plt.close()
+
+
+def correlation_check(merged):
+    daily = merged.groupby("date").agg(
+        pnl=("Closed PnL", "sum"), fg_value=("fg_value", "mean")
+    ).reset_index()
+    corr = daily["pnl"].corr(daily["fg_value"])
+    with open(OUT_DIR / "correlation.txt", "w") as f:
+        f.write(f"Pearson correlation between daily total closed PnL and FG index value: {corr:.4f}\n")
+    return corr
+
+
+def main():
+    FIG_DIR.mkdir(parents=True, exist_ok=True)
+    trades, fg = load_data()
+    merged = merge_data(trades, fg)
+
+    agg = sentiment_summary(merged)
+    account_level_summary(merged)
+    leverage_proxy(merged)
+
+    plot_avg_pnl(agg)
+    plot_win_rate(agg)
+    plot_volume(agg)
+    plot_daily_pnl_vs_fg(merged)
+    corr = correlation_check(merged)
+
+    print("=== Sentiment summary ===")
+    print(agg)
+    print(f"\nDaily PnL vs FG-index correlation: {corr:.4f}")
+    print("\nOutputs written to:", OUT_DIR)
+
+
+if __name__ == "__main__":
+    main()
